@@ -29,28 +29,5 @@
       "type": "image/svg+xml",
       "purpose": "maskable"
     }
-  ],
-  "shortcuts": [
-    {
-      "name": "记一顿",
-      "short_name": "记饮食",
-      "description": "快速记录食物与热量",
-      "url": "./?action=food",
-      "icons": [{ "src": "./assets/icon-192.png", "sizes": "192x192" }]
-    },
-    {
-      "name": "记训练",
-      "short_name": "记训练",
-      "description": "快速记录力量训练",
-      "url": "./?action=training",
-      "icons": [{ "src": "./assets/icon-192.png", "sizes": "192x192" }]
-    },
-    {
-      "name": "记体重",
-      "short_name": "记体重",
-      "description": "快速记录晨间体重",
-      "url": "./?action=weight",
-      "icons": [{ "src": "./assets/icon-192.png", "sizes": "192x192" }]
-    }
   ]
 }

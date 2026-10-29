@@ -79,6 +79,92 @@ function escapeHTML(value) {
     .replaceAll("'", "&#039;");
 }
 
+function normalizeSearch(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s·,，。/\\()（）_-]+/g, "");
+}
+
+function findExactFood(query) {
+  const normalized = normalizeSearch(query);
+  if (!normalized) return null;
+  return allFoods().find((food) => {
+    const names = [food.name, ...(food.aliases || [])].map(normalizeSearch);
+    return names.includes(normalized);
+  }) || null;
+}
+
+function findFood(query) {
+  const normalized = normalizeSearch(query);
+  if (!normalized) return null;
+  return findExactFood(normalized) || allFoods().find((food) => {
+    const names = [food.name, ...(food.aliases || [])].map(normalizeSearch);
+    return names.some((name) => normalized.includes(name) || name.includes(normalized));
+  }) || null;
+}
+
+function parseFoodInput(raw) {
+  const compact = String(raw ?? "").replace(/\s+/g, "");
+  const amountMatch = compact.match(/(\d+(?:\.\d+)?)(kg|千克|克|g|ml|毫升)/i);
+  const mealType = /早餐|早饭|早上/.test(compact) ? "早餐"
+    : /午餐|午饭|中午/.test(compact) ? "午餐"
+    : /晚餐|晚饭|晚上/.test(compact) ? "晚餐"
+    : /加餐|夜宵|下午茶/.test(compact) ? "加餐"
+    : null;
+  let grams = null;
+  if (amountMatch) {
+    grams = number(amountMatch[1]);
+    if (/kg|千克/i.test(amountMatch[2])) grams *= 1000;
+  }
+  const query = amountMatch ? compact.replace(amountMatch[0], "") : compact;
+  const isNaturalInput = Boolean(amountMatch || mealType) || /半碗|一碗|一杯|一个|一根|一片|一份|一勺/.test(compact);
+  const food = isNaturalInput ? findFood(query) : findExactFood(query);
+  if (!grams && food) {
+    const servingMultiplier = compact.includes("半碗") || compact.includes("半杯")
+      ? 0.5
+      : /一碗|一杯|一个|一根|一片|一份|一勺/.test(compact)
+        ? 1
+        : null;
+    if (servingMultiplier) grams = (food.defaultGrams || 100) * servingMultiplier;
+  }
+  return { food, grams, mealType };
+}
+
+function findExactActivity(query) {
+  const normalized = normalizeSearch(query);
+  if (!normalized) return null;
+  return EXERCISE_DATABASE.find((activity) => {
+    const names = [activity.name, ...(activity.aliases || [])].map(normalizeSearch);
+    return names.includes(normalized);
+  }) || null;
+}
+
+function calculateFoodNutrition(food, grams) {
+  const ratio = Math.max(0, number(grams)) / 100;
+  return {
+    calories: Math.round(number(food?.calories) * ratio),
+    protein: Math.round(number(food?.protein) * ratio * 10) / 10,
+    carbs: Math.round(number(food?.carbs) * ratio * 10) / 10,
+    fat: Math.round(number(food?.fat) * ratio * 10) / 10
+  };
+}
+
+function estimateActivityCalories(activity, minutes, intensity = 1) {
+  if (!activity) return 0;
+  return Math.max(0, Math.round(
+    number(activity.met) * number(intensity, 1) * 3.5 * number(db.profile.weight, 68) / 200 * number(minutes)
+  ));
+}
+
+function suggestedMealType() {
+  const hour = now().getHours();
+  if (hour < 10) return "早餐";
+  if (hour < 15) return "午餐";
+  if (hour < 21) return "晚餐";
+  return "加餐";
+}
+
 function makeSeedData() {
   const days = {};
   const foodTemplates = [
@@ -109,12 +195,13 @@ function makeSeedData() {
       foods: foodSets,
       workouts: i % 3 !== 2 ? [{
         id: id(`workout-${i}`),
-        name: i % 2 ? "下肢蹲" : "上肢推",
+        sourceActivityId: i % 2 ? "leg-training" : "chest-training",
+        name: i % 2 ? "腿部训练" : "胸部训练",
         duration: i % 2 ? 58 : 52,
         calories: i % 2 ? 365 : 312,
-        exercises: i % 2
-          ? [{ name: "深蹲", sets: 4, reps: 8, weight: 75 }, { name: "罗马尼亚硬拉", sets: 3, reps: 10, weight: 55 }]
-          : [{ name: "卧推", sets: 4, reps: 8, weight: 60 }, { name: "上斜哑铃", sets: 3, reps: 10, weight: 20 }],
+        trainingGroup: i % 2 ? "腿" : "胸",
+        intensity: 1,
+        exercises: [],
         time: "18:20"
       }] : [],
       cardio: i % 4 === 1 ? [{
@@ -145,15 +232,13 @@ function makeSeedData() {
     })),
     workouts: [{
       id: id("workout-today"),
-      name: "上肢推",
+      sourceActivityId: "chest-training",
+      name: "胸部训练",
       duration: 52,
       calories: 312,
-      exercises: [
-        { name: "杠铃卧推", sets: 4, reps: 8, weight: 60 },
-        { name: "上斜哑铃推", sets: 3, reps: 10, weight: 20 },
-        { name: "侧平举", sets: 3, reps: 15, weight: 8 },
-        { name: "绳索下压", sets: 3, reps: 12, weight: 25 }
-      ],
+      trainingGroup: "胸",
+      intensity: 1,
+      exercises: [],
       time: "18:20"
     }],
     cardio: [{
@@ -191,6 +276,7 @@ function makeSeedData() {
       bulkStartedAt: dateKey(dateFromOffset(-18)),
       reminder: true
     },
+    customFoods: [],
     days
   };
 }
@@ -198,11 +284,18 @@ function makeSeedData() {
 function loadData() {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (parsed?.profile && parsed?.days && parsed?.settings) return parsed;
+    if (parsed?.profile && parsed?.days && parsed?.settings) {
+      parsed.customFoods = Array.isArray(parsed.customFoods) ? parsed.customFoods : [];
+      return parsed;
+    }
   } catch (error) {
     console.warn("读取本地数据失败，已创建新的数据。", error);
   }
   return makeSeedData();
+}
+
+function allFoods() {
+  return [...(db.customFoods || []), ...FOOD_DATABASE];
 }
 
 function saveData() {
@@ -353,7 +446,9 @@ function renderTimeline(day, emptyAction = true) {
       icon: "dumbbell",
       color: "blue",
       title: item.name,
-      sub: `${item.exercises?.length || 1} 个动作 · ${item.duration || 0} 分钟`,
+      sub: item.trainingGroup
+        ? `${item.trainingGroup}部 · ${item.duration || 0} 分钟`
+        : `${item.exercises?.length || 1} 个动作 · ${item.duration || 0} 分钟`,
       value: `${fmt(item.calories)} kcal`,
       caption: item.time || "力量训练"
     });
@@ -475,23 +570,23 @@ function renderToday() {
       <section class="section" aria-labelledby="quick-title">
         <div class="section-head">
           <h2 id="quick-title">快速记录</h2>
-          <span class="text-button">3 秒完成</span>
+          <span class="text-button">自动换算</span>
         </div>
         <div class="quick-grid">
           <button class="quick-action food" data-action="record-food">
             <span class="quick-action-icon">${icon("food")}</span>
             <strong>记饮食</strong>
-            <span>食物 · 热量 · 三大项</span>
+            <span>输入食物和克数</span>
           </button>
           <button class="quick-action training" data-action="record-training">
             <span class="quick-action-icon">${icon("dumbbell")}</span>
-            <strong>记训练</strong>
-            <span>动作 · 组数 · 重量</span>
+            <strong>训练 / 有氧</strong>
+            <span>胸背肩腿 + 坡度有氧</span>
           </button>
-          <button class="quick-action cardio" data-action="record-cardio">
-            <span class="quick-action-icon">${icon("run")}</span>
-            <strong>记有氧</strong>
-            <span>时长 · 距离 · 消耗</span>
+          <button class="quick-action body" data-action="record-weight">
+            <span class="quick-action-icon">${icon("scale")}</span>
+            <strong>记身体</strong>
+            <span>体重 · 体脂趋势</span>
           </button>
         </div>
       </section>
@@ -553,26 +648,18 @@ const recordMeta = {
   food: {
     eyebrow: "DIET LOG",
     title: "吃进去的，<span class='thin'>都算数。</span>",
-    leadTitle: "一顿一顿，\n把营养补足。",
-    leadCopy: "记录热量，也记录蛋白质、碳水和脂肪。",
+    leadTitle: "输入食物和克数，\n营养自动换算。",
+    leadCopy: "内置常见食物数据库，不再手填热量和三大营养素。",
     className: "orange",
     heading: "添加食物"
   },
   training: {
-    eyebrow: "STRENGTH LOG",
-    title: "每一组，<span class='thin'>都有重量。</span>",
-    leadTitle: "动作、重量、次数，\n留下今天的进步。",
-    leadCopy: "自动累计训练时长与力量消耗。",
+    eyebrow: "TRAINING LOG",
+    title: "力量和心肺，<span class='thin'>一起记。</span>",
+    leadTitle: "只选部位，\n消耗交给系统估算。",
+    leadCopy: "无氧按胸、背、肩、腿记录；有氧优先使用坡度和爬楼机。",
     className: "blue",
-    heading: "添加训练动作"
-  },
-  cardio: {
-    eyebrow: "CARDIO LOG",
-    title: "让心率，<span class='thin'>再走一会儿。</span>",
-    leadTitle: "有氧不是惩罚，\n是心肺的长期投资。",
-    leadCopy: "记录种类、时长、距离与额外消耗。",
-    className: "violet",
-    heading: "添加有氧"
+    heading: "添加训练或有氧"
   },
   weight: {
     eyebrow: "BODY DATA",
@@ -584,140 +671,237 @@ const recordMeta = {
   }
 };
 
-function renderRecordForm(type, compact = false) {
-  if (type === "food") {
-    return `
-      <form data-form="food">
-        <div class="form-grid">
-          <div class="form-field full">
-            <label for="food-name">吃了什么</label>
-            <input class="form-input" id="food-name" name="name" placeholder="例如：鸡胸肉藜麦碗" required autocomplete="off" />
-          </div>
-          <div class="form-field full">
-            <label for="food-portion">份量或组成（可选）</label>
-            <input class="form-input" id="food-portion" name="portion" placeholder="鸡胸 180g / 藜麦 150g" autocomplete="off" />
-          </div>
+function renderFoodPickResult(food, grams) {
+  if (!food) {
+    return `<p class="auto-empty">输入食物名称或选择下方常用食物，营养值会自动出现。</p>`;
+  }
+  const nutrition = calculateFoodNutrition(food, grams);
+  return `
+    <div class="auto-result">
+      <div class="auto-result-head">
+        <span class="auto-result-label">${icon("spark")}数据库自动计算</span>
+        <span class="auto-result-label">每 100g ${fmt(food.calories)} kcal</span>
+      </div>
+      <strong>${fmt(nutrition.calories)}<small> kcal</small></strong>
+      <div class="auto-macros">
+        <span><strong>${nutrition.protein}g</strong>蛋白质</span>
+        <span><strong>${nutrition.carbs}g</strong>碳水</span>
+        <span><strong>${nutrition.fat}g</strong>脂肪</span>
+      </div>
+      <div class="field-help">${escapeHTML(food.name)} · ${number(grams)}g · ${escapeHTML(food.serving || "")}</div>
+    </div>
+  `;
+}
+
+function renderCustomFoodResult(values = {}) {
+  const protein = number(values.protein);
+  const carbs = number(values.carbs);
+  const fat = number(values.fat);
+  const grams = number(values.amount, 100);
+  if (!protein && !carbs && !fat) {
+    return `<p class="auto-empty">填写每 100g 的碳蛋脂后，这里会自动换算本次摄入。</p>`;
+  }
+  const per100Calories = Math.round(protein * 4 + carbs * 4 + fat * 9);
+  const ratio = grams / 100;
+  return `
+    <div class="auto-result">
+      <div class="auto-result-head">
+        <span class="auto-result-label">${icon("spark")}按 4 / 4 / 9 公式换算</span>
+        <span class="auto-result-label">每 100g ${fmt(per100Calories)} kcal</span>
+      </div>
+      <strong>${fmt(Math.round(per100Calories * ratio))}<small> kcal</small></strong>
+      <div class="auto-macros">
+        <span><strong>${oneDecimal(protein * ratio)}g</strong>蛋白质</span>
+        <span><strong>${oneDecimal(carbs * ratio)}g</strong>碳水</span>
+        <span><strong>${oneDecimal(fat * ratio)}g</strong>脂肪</span>
+      </div>
+      <div class="field-help">${escapeHTML(values.name || "自定义食物")} · ${number(grams)}g</div>
+    </div>
+  `;
+}
+
+function renderFoodForm() {
+  const recentIds = Object.keys(db.days)
+    .sort()
+    .reverse()
+    .flatMap((key) => db.days[key]?.foods || [])
+    .map((food) => food.sourceFoodId)
+    .filter(Boolean);
+  const quickIds = [...new Set([...recentIds, "raw-rice", "yeast-protein", "chicken-breast", "chicken-thigh", "cooking-oil", "cashews"])].slice(0, 7);
+  const foods = allFoods();
+  const quickFoods = quickIds.map((foodId) => foods.find((food) => food.id === foodId)).filter(Boolean);
+  return `
+    <form data-form="food" data-food-mode="library">
+      <div class="mode-switch" role="tablist" aria-label="饮食录入方式">
+        <button class="mode-button is-active" type="button" data-food-mode="library">从食物库选择</button>
+        <button class="mode-button" type="button" data-food-mode="custom">自定义 / 100g</button>
+      </div>
+      <div data-food-panel="library">
+        <div class="database-picker">
           <div class="form-field">
-            <label for="food-cal">热量</label>
-            <div class="input-suffix">
-              <input class="form-input" id="food-cal" name="calories" type="number" inputmode="decimal" min="0" placeholder="650" required />
-              <span>kcal</span>
-            </div>
+            <label for="food-query">食物名称</label>
+            <input class="form-input" id="food-query" name="foodQuery" list="food-options"
+              placeholder="例如：生大米 100克" autocomplete="off" data-food-input />
+            <input type="hidden" name="foodId" data-food-id />
           </div>
-          <div class="form-field">
-            <label for="meal-type">餐次</label>
-            <select class="form-select" id="meal-type" name="mealType">
-              <option>早餐</option><option>午餐</option><option>晚餐</option><option>加餐</option>
-            </select>
-          </div>
-          <div class="form-field">
-            <label for="food-protein">蛋白质</label>
-            <div class="input-suffix">
-              <input class="form-input" id="food-protein" name="protein" type="number" inputmode="decimal" min="0" placeholder="45" />
-              <span>g</span>
-            </div>
-          </div>
-          <div class="form-field">
-            <label for="food-carbs">碳水</label>
-            <div class="input-suffix">
-              <input class="form-input" id="food-carbs" name="carbs" type="number" inputmode="decimal" min="0" placeholder="70" />
-              <span>g</span>
-            </div>
-          </div>
-          <div class="form-field">
-            <label for="food-fat">脂肪</label>
-            <div class="input-suffix">
-              <input class="form-input" id="food-fat" name="fat" type="number" inputmode="decimal" min="0" placeholder="18" />
-              <span>g</span>
-            </div>
+          <datalist id="food-options">
+            ${foods.map((food) => `<option value="${escapeHTML(food.name)}" label="${fmt(food.calories)} kcal / 100g"></option>`).join("")}
+          </datalist>
+          <div class="database-suggestions" data-food-suggestions hidden></div>
+          <div class="database-tags" aria-label="常用食物">
+            ${quickFoods.map((food) => `<button class="database-tag" type="button" data-food-quick="${food.id}">${escapeHTML(food.name)}</button>`).join("")}
           </div>
         </div>
-        <button class="primary-button" type="submit">${icon("plus")}加入今日饮食</button>
-      </form>
-    `;
-  }
-  if (type === "training") {
-    return `
-      <form data-form="training">
-        <div class="form-grid">
-          <div class="form-field full">
-            <label for="training-name">动作名称</label>
-            <input class="form-input" id="training-name" name="name" placeholder="例如：杠铃卧推" required autocomplete="off" />
+        <div data-food-result>${renderFoodPickResult(null, 100)}</div>
+      </div>
+      <div data-food-panel="custom" hidden>
+        <div class="form-field full">
+          <label for="custom-food-name">食物名称</label>
+          <input class="form-input" id="custom-food-name" name="customName" placeholder="例如：自制鸡肉饭" autocomplete="off" data-custom-food-field />
+        </div>
+        <p class="field-help" style="margin:10px 2px 7px">填写包装或食物秤上的每 100g 含量</p>
+        <div class="form-grid three-columns">
+          <div class="form-field">
+            <label for="custom-protein">蛋白质 /100g</label>
+            <div class="input-suffix"><input class="form-input" id="custom-protein" name="customProtein" data-custom-food-field type="number" inputmode="decimal" min="0" max="100" step="0.1" placeholder="0" /><span>g</span></div>
           </div>
           <div class="form-field">
-            <label for="training-duration">训练时长</label>
-            <div class="input-suffix">
-              <input class="form-input" id="training-duration" name="duration" type="number" inputmode="numeric" min="0" placeholder="45" value="45" />
-              <span>分钟</span>
-            </div>
+            <label for="custom-carbs">碳水 /100g</label>
+            <div class="input-suffix"><input class="form-input" id="custom-carbs" name="customCarbs" data-custom-food-field type="number" inputmode="decimal" min="0" max="100" step="0.1" placeholder="0" /><span>g</span></div>
           </div>
           <div class="form-field">
-            <label for="training-cal">消耗</label>
-            <div class="input-suffix">
-              <input class="form-input" id="training-cal" name="calories" type="number" inputmode="decimal" min="0" placeholder="260" value="260" />
-              <span>kcal</span>
-            </div>
-          </div>
-          <div class="form-field">
-            <label for="training-sets">组数</label>
-            <div class="input-suffix">
-              <input class="form-input" id="training-sets" name="sets" type="number" inputmode="numeric" min="0" placeholder="4" value="4" />
-              <span>组</span>
-            </div>
-          </div>
-          <div class="form-field">
-            <label for="training-reps">次数</label>
-            <div class="input-suffix">
-              <input class="form-input" id="training-reps" name="reps" type="number" inputmode="numeric" min="0" placeholder="8" value="8" />
-              <span>次</span>
-            </div>
-          </div>
-          <div class="form-field full">
-            <label for="training-weight">使用重量（可选）</label>
-            <div class="input-suffix">
-              <input class="form-input" id="training-weight" name="weight" type="number" inputmode="decimal" min="0" placeholder="60" />
-              <span>kg</span>
-            </div>
+            <label for="custom-fat">脂肪 /100g</label>
+            <div class="input-suffix"><input class="form-input" id="custom-fat" name="customFat" data-custom-food-field type="number" inputmode="decimal" min="0" max="100" step="0.1" placeholder="0" /><span>g</span></div>
           </div>
         </div>
-        <button class="primary-button" type="submit">${icon("plus")}完成训练记录</button>
-      </form>
-    `;
-  }
-  if (type === "cardio") {
-    return `
-      <form data-form="cardio">
-        <div class="form-grid">
-          <div class="form-field full">
-            <label for="cardio-name">有氧类型</label>
-            <input class="form-input" id="cardio-name" name="name" placeholder="例如：坡度走、慢跑、骑车" required autocomplete="off" />
-          </div>
-          <div class="form-field">
-            <label for="cardio-duration">时长</label>
-            <div class="input-suffix">
-              <input class="form-input" id="cardio-duration" name="duration" type="number" inputmode="numeric" min="0" placeholder="30" value="30" required />
-              <span>分钟</span>
-            </div>
-          </div>
-          <div class="form-field">
-            <label for="cardio-cal">消耗</label>
-            <div class="input-suffix">
-              <input class="form-input" id="cardio-cal" name="calories" type="number" inputmode="decimal" min="0" placeholder="180" value="180" />
-              <span>kcal</span>
-            </div>
-          </div>
-          <div class="form-field full">
-            <label for="cardio-distance">距离（可选）</label>
-            <div class="input-suffix">
-              <input class="form-input" id="cardio-distance" name="distance" type="number" inputmode="decimal" min="0" step="0.1" placeholder="3.2" />
-              <span>km</span>
-            </div>
+        <div data-custom-food-result>${renderCustomFoodResult()}</div>
+        <label class="check-row">
+          <input type="checkbox" name="saveCustom" checked />
+          <span>保存到「我的食物」，下次可直接搜索</span>
+        </label>
+      </div>
+      <div class="form-grid" style="margin-top:13px">
+        <div class="form-field">
+          <label for="food-amount">重量</label>
+          <div class="input-suffix">
+            <input class="form-input" id="food-amount" name="amount" type="number" inputmode="decimal"
+              min="1" max="5000" value="100" data-food-amount required />
+            <span>克</span>
           </div>
         </div>
-        <button class="primary-button" type="submit">${icon("plus")}完成有氧记录</button>
-      </form>
+        <div class="form-field">
+          <label for="meal-type">餐次</label>
+          <select class="form-select" id="meal-type" name="mealType">
+            ${["早餐", "午餐", "晚餐", "加餐"].map((meal) => `<option ${meal === suggestedMealType() ? "selected" : ""}>${meal}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+      <button class="primary-button" type="submit" data-record-submit disabled>${icon("plus")}加入今日饮食</button>
+      <p class="field-help" style="margin-top:9px">生大米按生重记录。自定义食物按每 100g 碳蛋脂换算，热量按 4/4/9 公式估算。</p>
+    </form>
+  `;
+}
+
+function activityEstimateHTML(activity, minutes, intensity = 1) {
+  if (!activity) return "";
+  return `
+    <div class="auto-result dark">
+      <div class="auto-result-head">
+        <span class="auto-result-label">${icon("flame")}按 MET 自动估算</span>
+        <span class="auto-result-label">MET ${activity.met}</span>
+      </div>
+      <strong data-activity-calories>${fmt(estimateActivityCalories(activity, minutes, intensity))}<small> kcal</small></strong>
+      <p class="field-help" style="color:rgba(247,250,239,.48);margin-top:5px">
+        体重 ${oneDecimal(db.profile.weight)}kg · ${number(minutes)} 分钟 · 实际消耗会随强度和休息变化
+      </p>
+    </div>
+  `;
+}
+
+function renderActivityFields(activity) {
+  if (!activity) {
+    return `<p class="auto-empty">输入动作名称，力量训练和有氧会显示对应的记录项。</p>`;
+  }
+  if (activity.category === "strength") {
+    const minutes = activity.defaultMinutes || 45;
+    return `
+      <div class="activity-heading" style="margin:14px 0 10px">
+        <span class="activity-badge">无氧</span>
+        <span class="field-help">${escapeHTML(activity.group)}部训练 · 按训练部位记录</span>
+      </div>
+      <div class="form-grid">
+        <div class="form-field">
+          <label for="activity-duration">训练时长</label>
+          <div class="input-suffix"><input class="form-input" id="activity-duration" name="duration" data-activity-duration type="number" inputmode="numeric" min="1" max="300" value="${minutes}" /><span>分钟</span></div>
+        </div>
+        <div class="form-field">
+          <label for="activity-intensity">训练强度</label>
+          <select class="form-select" id="activity-intensity" name="intensity" data-activity-intensity>
+            <option value="0.85">轻 · 留有余力</option>
+            <option value="1" selected>中 · 正常训练</option>
+            <option value="1.2">高 · 接近力竭</option>
+          </select>
+        </div>
+      </div>
+      <div data-activity-result>${activityEstimateHTML(activity, minutes, 1)}</div>
     `;
   }
+  const minutes = activity.defaultMinutes || 30;
+  return `
+    <div class="activity-heading" style="margin:14px 0 10px">
+      <span class="activity-badge cardio">有氧</span>
+      <span class="field-help">${escapeHTML(activity.group)} · 填时长即可估算</span>
+    </div>
+    <div class="form-grid">
+      <div class="form-field">
+        <label for="activity-duration">时长</label>
+        <div class="input-suffix"><input class="form-input" id="activity-duration" name="duration" data-activity-duration type="number" inputmode="numeric" min="1" max="600" value="${minutes}" /><span>分钟</span></div>
+      </div>
+      <div class="form-field">
+        <label for="activity-distance">距离（可选）</label>
+        <div class="input-suffix"><input class="form-input" id="activity-distance" name="distance" type="number" inputmode="decimal" min="0" step="0.1" placeholder="3.0" /><span>km</span></div>
+      </div>
+    </div>
+    <div data-activity-result>${activityEstimateHTML(activity, minutes)}</div>
+  `;
+}
+
+function renderTrainingForm() {
+  const recentIds = Object.keys(db.days)
+    .sort()
+    .reverse()
+    .flatMap((key) => [...(db.days[key]?.workouts || []), ...(db.days[key]?.cardio || [])])
+    .map((activity) => activity.sourceActivityId)
+    .filter(Boolean);
+  const quickIds = [...new Set([...recentIds, "chest-training", "back-training", "shoulder-training", "leg-training", "incline-walk", "stair-climber"])].slice(0, 7);
+  const quickActivities = quickIds.map((activityId) => EXERCISE_DATABASE.find((activity) => activity.id === activityId)).filter(Boolean);
+  return `
+    <form data-form="training">
+      <div class="database-picker">
+        <div class="form-field">
+          <label for="activity-query">选择训练部位或有氧</label>
+          <input class="form-input" id="activity-query" name="activityQuery" list="activity-options"
+            placeholder="例如：胸、背、肩、腿、坡度走" autocomplete="off" data-activity-input required />
+          <input type="hidden" name="activityId" data-activity-id />
+        </div>
+        <datalist id="activity-options">
+          ${EXERCISE_DATABASE.map((activity) => `<option value="${escapeHTML(activity.name)}" label="${activity.category === "strength" ? "力量" : "有氧"} · ${escapeHTML(activity.group)}"></option>`).join("")}
+        </datalist>
+        <div class="database-suggestions" data-activity-suggestions hidden></div>
+        <div class="database-tags" aria-label="常用动作">
+          ${quickActivities.map((activity) => `<button class="database-tag" type="button" data-activity-quick="${activity.id}">${escapeHTML(activity.name)}</button>`).join("")}
+        </div>
+      </div>
+      <div data-activity-fields>${renderActivityFields(null)}</div>
+      <button class="primary-button" type="submit" data-record-submit disabled>${icon("plus")}完成训练记录</button>
+      <p class="field-help" style="margin-top:9px">力量和有氧使用同一动作库。热量为 MET 公式估算，不作为医疗或精密能量测量依据。</p>
+    </form>
+  `;
+}
+
+function renderRecordForm(type) {
+  if (type === "food") return renderFoodForm();
+  if (type === "training") return renderTrainingForm();
   return `
     <form data-form="weight">
       <div class="form-grid">
@@ -743,13 +927,17 @@ function renderRecordForm(type, compact = false) {
 
 function renderRecentRecords(type) {
   const day = getDay();
-  const lists = {
-    food: day.foods,
-    training: day.workouts,
-    cardio: day.cardio,
-    weight: day.weight ? [{ id: "weight-today", name: `${oneDecimal(day.weight)} kg`, calories: day.bodyFat ? `${oneDecimal(day.bodyFat)}% 体脂` : "", weight: day.weight }] : []
-  };
-  const items = lists[type] || [];
+  let items = [];
+  if (type === "food") items = day.foods;
+  if (type === "training") {
+    items = [
+      ...day.workouts.map((item) => ({ ...item, recordKind: "training" })),
+      ...day.cardio.map((item) => ({ ...item, recordKind: "cardio" }))
+    ].sort((a, b) => String(a.time || "").localeCompare(String(b.time || "")));
+  }
+  if (type === "weight" && day.weight) {
+    items = [{ id: "weight-today", name: `${oneDecimal(day.weight)} kg`, calories: day.bodyFat ? `${oneDecimal(day.bodyFat)}% 体脂` : "", weight: day.weight }];
+  }
   if (!items.length) {
     return `<div class="empty-row">还没有今天的记录</div>`;
   }
@@ -764,10 +952,15 @@ function renderRecentRecords(type) {
       `;
     }
     const detail = type === "food"
-      ? `P ${Math.round(item.protein || 0)} · C ${Math.round(item.carbs || 0)} · F ${Math.round(item.fat || 0)}`
+      ? `${item.amount ? `${oneDecimal(item.amount)}g · ` : ""}碳水 ${oneDecimal(item.carbs || 0)}g · 蛋白 ${oneDecimal(item.protein || 0)}g`
       : type === "training"
-        ? `${item.duration || 0} 分钟 · ${item.exercises?.[0]?.sets || 0} 组`
+        ? item.recordKind === "cardio"
+          ? `有氧 · ${item.duration || 0} 分钟${item.distance ? ` · ${item.distance} km` : ""}`
+          : item.trainingGroup
+            ? `无氧 · ${item.trainingGroup}部 · ${item.duration || 0} 分钟`
+            : `力量 · ${item.duration || 0} 分钟 · ${item.exercises?.[0]?.sets || 0} 组`
         : `${item.duration || 0} 分钟${item.distance ? ` · ${item.distance} km` : ""}`;
+    const deleteType = item.recordKind || type;
     return `
       <div class="recent-item">
         <div class="recent-item-main">
@@ -775,20 +968,15 @@ function renderRecentRecords(type) {
           <span>${escapeHTML(detail)}</span>
         </div>
         <span class="recent-item-value">${fmt(item.calories)} kcal</span>
-        <button class="delete-button" data-delete="${type}" data-id="${escapeHTML(item.id)}" aria-label="删除">${icon("trash")}</button>
+        <button class="delete-button" data-delete="${deleteType}" data-id="${escapeHTML(item.id)}" aria-label="删除">${icon("trash")}</button>
       </div>
     `;
   }).join("");
 }
 
 function renderRecord() {
+  if (!["food", "training", "weight"].includes(recordType)) recordType = "food";
   const meta = recordMeta[recordType];
-  const foodsQuick = [
-    ["鸡胸肉 150g", 248, 46, 0, 6],
-    ["米饭 1 碗", 230, 5, 50, 1],
-    ["鸡蛋 2 个", 144, 13, 1, 10],
-    ["乳清蛋白 1 勺", 120, 24, 3, 2]
-  ];
 
   $("#screen").innerHTML = `
     <div class="page-enter">
@@ -797,10 +985,10 @@ function renderRecord() {
         title: meta.title,
         note: "所有数据只保存在你的手机里。"
       })}
-      <div class="segment-control" role="tablist" aria-label="记录类型">
-        ${["food", "training", "cardio", "weight"].map((type) => `
+      <div class="segment-control" style="--segment-count:3" role="tablist" aria-label="记录类型">
+        ${["food", "training", "weight"].map((type) => `
           <button class="segment-button ${recordType === type ? "is-active" : ""}" data-record-tab="${type}" role="tab" aria-selected="${recordType === type}">
-            ${{ food: "饮食", training: "训练", cardio: "有氧", weight: "身体" }[type]}
+            ${{ food: "饮食", training: "训练 / 有氧", weight: "身体" }[type]}
           </button>
         `).join("")}
       </div>
@@ -812,17 +1000,8 @@ function renderRecord() {
       <section class="form-card">
         <div class="form-head">
           <strong>${meta.heading}</strong>
-          <span>${recordType === "weight" ? "建议每天固定时间" : "留空项按 0 计算"}</span>
+          <span>${recordType === "weight" ? "建议每天固定时间" : recordType === "food" ? "填克数自动换算" : "选部位或类型"}</span>
         </div>
-        ${recordType === "food" ? `
-          <div class="preset-row" aria-label="常用食物">
-            ${foodsQuick.map((food) => `
-              <button class="preset-chip" data-preset='${JSON.stringify({ name: food[0], calories: food[1], protein: food[2], carbs: food[3], fat: food[4] }).replaceAll("'", "&#39;")}'>
-                ${food[0]} · ${food[1]}
-              </button>
-            `).join("")}
-          </div>
-        ` : ""}
         ${renderRecordForm(recordType)}
       </section>
       <section class="section recent-list">
@@ -934,21 +1113,17 @@ function weekMetrics() {
   const days = lastSevenDays();
   let workoutMinutes = 0;
   let cardioMinutes = 0;
-  let totalVolume = 0;
   let sessions = 0;
   days.forEach(({ day }) => {
     day.workouts.forEach((workout) => {
       sessions += 1;
       workoutMinutes += number(workout.duration);
-      (workout.exercises || []).forEach((exercise) => {
-        totalVolume += number(exercise.sets) * number(exercise.reps) * number(exercise.weight);
-      });
     });
     day.cardio.forEach((cardio) => {
       cardioMinutes += number(cardio.duration);
     });
   });
-  return { sessions, workoutMinutes, cardioMinutes, totalVolume };
+  return { sessions, workoutMinutes, cardioMinutes };
 }
 
 function renderHeatmap() {
@@ -986,7 +1161,7 @@ function renderTrends() {
         </div>
         <div class="metric-grid">
           <div class="metric-card"><span>训练时长</span><strong>${metrics.workoutMinutes}<small> 分钟</small></strong><p>力量训练累计</p></div>
-          <div class="metric-card"><span>训练容量</span><strong>${Math.round(metrics.totalVolume / 100) / 10}<small> 吨</small></strong><p>组数 × 次数 × 重量</p></div>
+          <div class="metric-card"><span>无氧次数</span><strong>${metrics.sessions}<small> 次</small></strong><p>按胸背肩腿记录</p></div>
           <div class="metric-card"><span>有氧时长</span><strong>${metrics.cardioMinutes}<small> 分钟</small></strong><p>低强度稳态为主</p></div>
           <div class="metric-card"><span>记录完成</span><strong>${lastSevenDays().filter((item) => getTotals(item.day).calories > 0).length}<small> / 7 天</small></strong><p>饮食记录覆盖</p></div>
         </div>
@@ -1067,25 +1242,10 @@ function renderProfile() {
         <div class="section-head"><h2>手机与数据</h2></div>
         <div class="settings-card">
           ${settingsButton("apple", "安装到手机主屏幕", "离线启动 · 全屏使用 · 无服务器", "install")}
-          ${settingsButton("link", "桌面快捷入口", "长按图标或创建快捷指令", "widget-help")}
+          ${settingsButton("food", "食物与动作数据库", `${allFoods().length} 种食物 · ${EXERCISE_DATABASE.length} 个训练类型`, "database-info")}
           ${settingsButton("download", "导出本地备份", "生成 JSON 数据文件", "export-data")}
           ${settingsButton("upload", "导入备份", "从 JSON 文件恢复全部数据", "import-data")}
           ${settingsButton("trash", "清空并重新开始", "移除示例数据，从空白开始", "reset-data", "danger")}
-        </div>
-      </section>
-
-      <section class="section">
-        <div class="section-head">
-          <div><h2>今日片段</h2><p>可作为主屏幕快捷入口</p></div>
-        </div>
-        <div class="widget-preview">
-          <small>燃刻 · TODAY</small>
-          <strong>${fmt(calculateEnergy().calories)} <span>/ ${fmt(db.settings.targetCalories)} kcal</span></strong>
-          <p>${calculateEnergy().remaining >= 0 ? `还可摄入 ${fmt(calculateEnergy().remaining)} kcal` : `超出 ${fmt(Math.abs(calculateEnergy().remaining))} kcal`} · ${db.settings.fatigueWeek ? "减量周" : "训练日"}</p>
-          <div class="widget-actions">
-            <button data-action="record-food" aria-label="快速记录饮食">${icon("food")}</button>
-            <button data-action="record-training" aria-label="快速记录训练">${icon("dumbbell")}</button>
-          </div>
         </div>
       </section>
 
@@ -1093,7 +1253,7 @@ function renderProfile() {
         <strong>基础代谢怎么算？</strong>
         <p>采用 Mifflin–St Jeor 公式计算，再结合你的日常活动系数与当天运动消耗，估算总消耗。它是起点，不是绝对答案；持续观察 2–3 周体重趋势再调整。</p>
       </section>
-      <p class="app-meta">燃刻 RANKE · v1.0<br>离线优先 · 数据不会离开你的设备${db.isDemo ? " · 当前含示例数据" : ""}</p>
+      <p class="app-meta">燃刻 RANKE · v1.3<br>离线优先 · 数据不会离开你的设备${db.isDemo ? " · 当前含示例数据" : ""}</p>
     </div>
   `;
 }
@@ -1138,17 +1298,18 @@ function switchTab(tab) {
 }
 
 function openSheet(type) {
+  if (type === "cardio") type = "training";
   const backdrop = $("#sheetBackdrop");
   const sheet = $("#bottomSheet");
   let title = "";
   let kicker = "";
   let body = "";
 
-  if (["food", "training", "cardio", "weight"].includes(type)) {
+  if (["food", "training", "weight"].includes(type)) {
     const meta = recordMeta[type];
     title = meta.heading;
-    kicker = type === "food" ? "记一顿" : type === "training" ? "记训练" : type === "cardio" ? "记有氧" : "记身体";
-    body = renderRecordForm(type, true);
+    kicker = type === "food" ? "记一顿" : type === "training" ? "训练 / 有氧" : "记身体";
+    body = renderRecordForm(type);
   } else if (type === "profile") {
     title = "身体档案";
     kicker = "PROFILE";
@@ -1228,23 +1389,23 @@ function openSheet(type) {
         <button class="primary-button" type="submit">${icon("target")}保存每日目标</button>
       </form>
     `;
-  } else if (type === "widget-help") {
-    title = "桌面快捷入口";
-    kicker = "WIDGET & SHORTCUT";
+  } else if (type === "database-info") {
+    title = "本地数据库";
+    kicker = "FOOD & ACTIVITY DATA";
     body = `
       <div class="formula-card" style="margin-top:0">
-        <strong>先安装到主屏幕</strong>
-        <p>iPhone：Safari → 分享 → 添加到主屏幕。安卓：Chrome → 右上角菜单 → 安装应用或添加到主屏幕。安装后无需网络即可打开。</p>
+        <strong>食物营养库 · ${allFoods().length} 种</strong>
+        <p>包含生大米、鸡胸鸡腿、酵母蛋白粉、食用油、腰果、核桃等常见食物，另有 ${db.customFoods?.length || 0} 种你保存的自定义食物。基础食材参考《中国食物成分表》与 USDA FoodData Central。</p>
       </div>
       <div class="formula-card">
-        <strong>快速记录入口</strong>
-        <p>长按燃刻图标，可直接选择「记一顿」「记训练」「记体重」。iPhone 也可在「快捷指令」中创建打开这些入口的快捷指令，并添加到锁屏或主屏幕。</p>
+        <strong>训练类型库 · ${EXERCISE_DATABASE.length} 个</strong>
+        <p>无氧按胸、背、肩、腿四个部位记录，不再拆分具体动作；有氧优先提供坡度走和爬楼机。热量按 MET、体重、时长和训练强度估算。</p>
       </div>
       <div class="formula-card">
-        <strong>系统级桌面小组件</strong>
-        <p>纯网页应用不能直接注册 iOS WidgetKit 或 Android AppWidget。若需要可实时显示并一键记录的原生系统组件，需要后续用 Capacitor 封装并加入两端的原生 Widget 扩展；当前版本已把数据和快速链接准备好。</p>
+        <strong>为什么是估算值？</strong>
+        <p>食物品牌、烹调油量、含水量，以及训练中的休息和真实强度都会影响结果。建议优先看一周趋势；如果发现长期偏差，可调整每日热量目标。</p>
       </div>
-      <button class="primary-button" data-action="install">${icon("download")}安装燃刻</button>
+      <button class="primary-button" data-action="close-sheet">${icon("close")}我知道了</button>
     `;
   }
 
@@ -1259,10 +1420,15 @@ function openSheet(type) {
   backdrop.hidden = false;
   sheet.hidden = false;
   document.body.style.overflow = "hidden";
-  requestAnimationFrame(() => $("input, select, button", sheet)?.focus({ preventScroll: true }));
+  syncVisualViewport();
+  if (type === "food" || type === "training") {
+    requestAnimationFrame(() => $("[data-food-input], [data-activity-input]", sheet)?.focus({ preventScroll: true }));
+  }
 }
 
 function closeSheet() {
+  if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  document.body.classList.remove("keyboard-open");
   $("#sheetBackdrop").hidden = true;
   $("#bottomSheet").hidden = true;
   document.body.style.overflow = "";
@@ -1281,44 +1447,313 @@ function timeNow() {
   return new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
+function selectFood(form, food, grams = food?.defaultGrams || 100) {
+  if (!form || !food) return;
+  form.dataset.foodId = food.id;
+  const idField = $("[data-food-id]", form);
+  const queryField = $("[data-food-input]", form);
+  const amountField = $("[data-food-amount]", form);
+  if (idField) idField.value = food.id;
+  if (queryField) queryField.value = food.name;
+  if (amountField) amountField.value = number(grams, food.defaultGrams || 100);
+  const result = $("[data-food-result]", form);
+  if (result) result.innerHTML = renderFoodPickResult(food, number(amountField?.value, food.defaultGrams || 100));
+  const submit = $("[data-record-submit]", form);
+  if (submit) submit.disabled = false;
+  const suggestions = $("[data-food-suggestions]", form);
+  if (suggestions) suggestions.hidden = true;
+  $$("[data-food-quick]", form).forEach((button) => {
+    button.classList.toggle("is-selected", button.dataset.foodQuick === food.id);
+  });
+}
+
+function showFoodSuggestions(form, rawValue) {
+  const container = $("[data-food-suggestions]", form);
+  if (!container) return;
+  const query = normalizeSearch(rawValue);
+  if (!query || form.dataset.foodId) {
+    container.hidden = true;
+    return;
+  }
+  const matches = allFoods()
+    .map((food) => {
+      const name = normalizeSearch(food.name);
+      const aliases = (food.aliases || []).map(normalizeSearch);
+      const score = name === query ? 0 : name.startsWith(query) ? 1 : name.includes(query) ? 2 : aliases.some((alias) => alias.startsWith(query)) ? 3 : aliases.some((alias) => alias.includes(query)) ? 4 : 99;
+      return { food, score };
+    })
+    .filter((item) => item.score < 99)
+    .sort((a, b) => a.score - b.score)
+    .slice(0, 7);
+  if (!matches.length) {
+    container.innerHTML = `<div class="suggestion-empty">食物库里暂时没有匹配项，可以换个常见名称试试。</div>`;
+  } else {
+    container.innerHTML = matches.map(({ food }) => `
+      <button class="suggestion-button" type="button" data-food-suggestion="${food.id}">
+        <span><strong>${escapeHTML(food.name)}</strong><small>${escapeHTML(food.category)} · ${escapeHTML(food.serving || "按克数记录")}</small></span>
+        <span>${fmt(food.calories)} kcal</span>
+      </button>
+    `).join("");
+  }
+  container.hidden = false;
+}
+
+function updateFoodForm(form, rawValue) {
+  if (!form) return;
+  const parsed = parseFoodInput(rawValue);
+  if (!parsed.food) {
+    delete form.dataset.foodId;
+    const idField = $("[data-food-id]", form);
+    const result = $("[data-food-result]", form);
+    const submit = $("[data-record-submit]", form);
+    if (idField) idField.value = "";
+    if (result) result.innerHTML = renderFoodPickResult(null, 100);
+    if (submit) submit.disabled = true;
+    $$("[data-food-quick]", form).forEach((button) => button.classList.remove("is-selected"));
+    return;
+  }
+  selectFood(form, parsed.food, parsed.grams || parsed.food.defaultGrams || 100);
+  if (parsed.mealType) {
+    const mealField = form.elements.namedItem("mealType");
+    if (mealField) mealField.value = parsed.mealType;
+  }
+}
+
+function refreshFoodAmount(form) {
+  const food = allFoods().find((item) => item.id === form?.dataset.foodId);
+  if (!food) return;
+  const grams = number($("[data-food-amount]", form)?.value, 100);
+  const result = $("[data-food-result]", form);
+  if (result) result.innerHTML = renderFoodPickResult(food, grams);
+}
+
+function customFoodValues(form) {
+  return {
+    name: String(form.elements.namedItem("customName")?.value || "").trim(),
+    protein: number(form.elements.namedItem("customProtein")?.value),
+    carbs: number(form.elements.namedItem("customCarbs")?.value),
+    fat: number(form.elements.namedItem("customFat")?.value),
+    amount: number(form.elements.namedItem("amount")?.value, 100)
+  };
+}
+
+function refreshCustomFood(form) {
+  const values = customFoodValues(form);
+  const result = $("[data-custom-food-result]", form);
+  if (result) result.innerHTML = renderCustomFoodResult(values);
+  const submit = $("[data-record-submit]", form);
+  if (submit) {
+    submit.disabled = !(values.name && values.amount > 0 && values.protein + values.carbs + values.fat > 0);
+  }
+}
+
+function switchFoodMode(form, mode) {
+  if (!form || !["library", "custom"].includes(mode)) return;
+  form.dataset.foodMode = mode;
+  $$("[data-food-mode]", form).forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.foodMode === mode);
+  });
+  $$("[data-food-panel]", form).forEach((panel) => {
+    panel.hidden = panel.dataset.foodPanel !== mode;
+  });
+  const submit = $("[data-record-submit]", form);
+  if (mode === "custom") {
+    refreshCustomFood(form);
+  } else if (submit) {
+    submit.disabled = !form.dataset.foodId;
+  }
+}
+
+function selectActivity(form, activity) {
+  if (!form || !activity) return;
+  form.dataset.activityId = activity.id;
+  const idField = $("[data-activity-id]", form);
+  const queryField = $("[data-activity-input]", form);
+  const fields = $("[data-activity-fields]", form);
+  if (idField) idField.value = activity.id;
+  if (queryField) queryField.value = activity.name;
+  if (fields) fields.innerHTML = renderActivityFields(activity);
+  const submit = $("[data-record-submit]", form);
+  if (submit) submit.disabled = false;
+  const suggestions = $("[data-activity-suggestions]", form);
+  if (suggestions) suggestions.hidden = true;
+  $$("[data-activity-quick]", form).forEach((button) => {
+    button.classList.toggle("is-selected", button.dataset.activityQuick === activity.id);
+  });
+}
+
+function showActivitySuggestions(form, rawValue) {
+  const container = $("[data-activity-suggestions]", form);
+  if (!container) return;
+  const query = normalizeSearch(rawValue);
+  if (!query || form.dataset.activityId) {
+    container.hidden = true;
+    return;
+  }
+  const matches = EXERCISE_DATABASE
+    .map((activity) => {
+      const name = normalizeSearch(activity.name);
+      const aliases = (activity.aliases || []).map(normalizeSearch);
+      const score = name === query ? 0 : name.startsWith(query) ? 1 : name.includes(query) ? 2 : aliases.some((alias) => alias.startsWith(query)) ? 3 : aliases.some((alias) => alias.includes(query)) ? 4 : 99;
+      return { activity, score };
+    })
+    .filter((item) => item.score < 99)
+    .sort((a, b) => a.score - b.score)
+    .slice(0, 7);
+  if (!matches.length) {
+    container.innerHTML = `<div class="suggestion-empty">没有匹配项，试试“胸”“背”“肩”“腿”“坡度走”或“爬楼机”。</div>`;
+  } else {
+    container.innerHTML = matches.map(({ activity }) => `
+      <button class="suggestion-button" type="button" data-activity-suggestion="${activity.id}">
+        <span><strong>${escapeHTML(activity.name)}</strong><small>${activity.category === "strength" ? "力量" : "有氧"} · ${escapeHTML(activity.group)}</small></span>
+        <span>MET ${activity.met}</span>
+      </button>
+    `).join("");
+  }
+  container.hidden = false;
+}
+
+function updateActivityForm(form, rawValue) {
+  if (!form) return;
+  const activity = findExactActivity(rawValue);
+  if (!activity) {
+    delete form.dataset.activityId;
+    const idField = $("[data-activity-id]", form);
+    const fields = $("[data-activity-fields]", form);
+    const submit = $("[data-record-submit]", form);
+    if (idField) idField.value = "";
+    if (fields) fields.innerHTML = renderActivityFields(null);
+    if (submit) submit.disabled = true;
+    $$("[data-activity-quick]", form).forEach((button) => button.classList.remove("is-selected"));
+    return;
+  }
+  if (form.dataset.activityId === activity.id) return;
+  selectActivity(form, activity);
+}
+
+function refreshActivityEstimate(form) {
+  const activity = EXERCISE_DATABASE.find((item) => item.id === form?.dataset.activityId);
+  if (!activity) return;
+  const duration = number($("[data-activity-duration]", form)?.value, activity.defaultMinutes || 30);
+  const intensity = number($("[data-activity-intensity]", form)?.value, 1);
+  const result = $("[data-activity-result]", form);
+  if (result) result.innerHTML = activityEstimateHTML(activity, duration, intensity);
+}
+
+function syncVisualViewport() {
+  const viewport = window.visualViewport;
+  const visualHeight = Math.max(260, viewport?.height || window.innerHeight);
+  const offsetTop = viewport?.offsetTop || 0;
+  const keyboardInset = Math.max(0, window.innerHeight - visualHeight - offsetTop);
+  document.documentElement.style.setProperty("--vvh", `${visualHeight}px`);
+  document.documentElement.style.setProperty("--keyboard-inset", `${keyboardInset}px`);
+  document.body.classList.toggle("keyboard-open", keyboardInset > 100);
+  if (!$("#bottomSheet").hidden && document.activeElement instanceof HTMLElement) {
+    window.setTimeout(() => {
+      document.activeElement?.scrollIntoView({ block: "center", behavior: "smooth" });
+    }, 80);
+  }
+}
+
 function submitRecord(type, form) {
   const data = Object.fromEntries(new FormData(form).entries());
   const day = getDay(dateKey(), true);
   if (type === "food") {
+    const grams = number(data.amount);
+    let food = allFoods().find((item) => item.id === data.foodId);
+    if (form.dataset.foodMode === "custom") {
+      const custom = customFoodValues(form);
+      if (!custom.name || custom.amount <= 0 || custom.protein + custom.carbs + custom.fat <= 0) {
+        showToast("请填写食物名称和每 100g 的碳蛋脂含量");
+        return;
+      }
+      const calories100 = Math.round(custom.protein * 4 + custom.carbs * 4 + custom.fat * 9);
+      if (data.saveCustom) {
+        db.customFoods = Array.isArray(db.customFoods) ? db.customFoods : [];
+        const existing = db.customFoods.find((item) => normalizeSearch(item.name) === normalizeSearch(custom.name));
+        food = {
+          ...(existing || {}),
+          id: existing?.id || id("custom-food"),
+          name: custom.name,
+          category: "我的食物",
+          aliases: [],
+          calories: calories100,
+          protein: custom.protein,
+          carbs: custom.carbs,
+          fat: custom.fat,
+          defaultGrams: 100,
+          serving: "自定义 · 每 100g",
+          isCustom: true
+        };
+        if (existing) {
+          Object.assign(existing, food);
+        } else {
+          db.customFoods.unshift(food);
+        }
+      } else {
+        food = {
+          id: "custom-temporary",
+          name: custom.name,
+          calories: calories100,
+          protein: custom.protein,
+          carbs: custom.carbs,
+          fat: custom.fat,
+          serving: "本次自定义"
+        };
+      }
+    }
+    if (!food || grams <= 0) {
+      showToast("请先选择食物并填写重量");
+      return;
+    }
+    const nutrition = calculateFoodNutrition(food, grams);
     day.foods.push({
       id: id("food"),
-      name: data.name.trim(),
-      portion: data.portion.trim(),
-      calories: number(data.calories),
-      protein: number(data.protein),
-      carbs: number(data.carbs),
-      fat: number(data.fat),
+      sourceFoodId: food.id,
+      name: food.name,
+      portion: `${grams}g`,
+      amount: grams,
+      calories: nutrition.calories,
+      protein: nutrition.protein,
+      carbs: nutrition.carbs,
+      fat: nutrition.fat,
       mealType: data.mealType,
       time: timeNow()
     });
   } else if (type === "training") {
-    day.workouts.push({
-      id: id("workout"),
-      name: data.name.trim(),
-      duration: number(data.duration),
-      calories: number(data.calories),
-      exercises: [{
-        name: data.name.trim(),
-        sets: number(data.sets),
-        reps: number(data.reps),
-        weight: number(data.weight)
-      }],
-      time: timeNow()
-    });
-  } else if (type === "cardio") {
-    day.cardio.push({
-      id: id("cardio"),
-      name: data.name.trim(),
-      duration: number(data.duration),
-      calories: number(data.calories),
-      distance: number(data.distance),
-      time: timeNow()
-    });
+    const activity = EXERCISE_DATABASE.find((item) => item.id === data.activityId);
+    const duration = number(data.duration);
+    const intensity = number(data.intensity, 1);
+    if (!activity || duration <= 0) {
+      showToast("请先选择动作并填写时长");
+      return;
+    }
+    const calories = estimateActivityCalories(activity, duration, intensity);
+    if (activity.category === "strength") {
+      day.workouts.push({
+        id: id("workout"),
+        sourceActivityId: activity.id,
+        name: activity.name,
+        duration,
+        calories,
+        met: activity.met,
+        trainingGroup: activity.group,
+        intensity,
+        exercises: [],
+        time: timeNow()
+      });
+    } else {
+      day.cardio.push({
+        id: id("cardio"),
+        sourceActivityId: activity.id,
+        name: activity.name,
+        duration,
+        calories,
+        met: activity.met,
+        distance: number(data.distance),
+        time: timeNow()
+      });
+    }
   } else if (type === "weight") {
     day.weight = number(data.weight);
     day.bodyFat = data.bodyFat ? number(data.bodyFat) : null;
@@ -1328,7 +1763,7 @@ function submitRecord(type, form) {
   saveData();
   closeSheet();
   render();
-  showToast(type === "weight" ? "身体数据已记录" : "记录已保存，只在这台设备上");
+  showToast(type === "weight" ? "身体数据已记录" : "已自动计算并保存");
 }
 
 function deleteRecord(type, itemId) {
@@ -1402,6 +1837,7 @@ function importData(file) {
     try {
       const parsed = JSON.parse(reader.result);
       if (!parsed.profile || !parsed.days || !parsed.settings) throw new Error("invalid");
+      parsed.customFoods = Array.isArray(parsed.customFoods) ? parsed.customFoods : [];
       db = parsed;
       saveData();
       closeSheet();
@@ -1480,17 +1916,37 @@ document.addEventListener("click", (event) => {
     return;
   }
 
-  const preset = event.target.closest("[data-preset]");
-  if (preset) {
-    const food = JSON.parse(preset.dataset.preset);
-    const form = $('form[data-form="food"]');
-    if (form) {
-      Object.entries(food).forEach(([key, value]) => {
-        const field = form.elements.namedItem(key);
-        if (field) field.value = value;
-      });
-      form.elements.namedItem("name")?.focus();
-    }
+  const foodMode = event.target.closest("button[data-food-mode]");
+  if (foodMode) {
+    switchFoodMode(foodMode.closest("form"), foodMode.dataset.foodMode);
+    return;
+  }
+
+  const foodQuick = event.target.closest("[data-food-quick]");
+  if (foodQuick) {
+    const food = allFoods().find((item) => item.id === foodQuick.dataset.foodQuick);
+    selectFood(foodQuick.closest("form"), food);
+    return;
+  }
+
+  const foodSuggestion = event.target.closest("[data-food-suggestion]");
+  if (foodSuggestion) {
+    const food = allFoods().find((item) => item.id === foodSuggestion.dataset.foodSuggestion);
+    selectFood(foodSuggestion.closest("form"), food);
+    return;
+  }
+
+  const activityQuick = event.target.closest("[data-activity-quick]");
+  if (activityQuick) {
+    const activity = EXERCISE_DATABASE.find((item) => item.id === activityQuick.dataset.activityQuick);
+    selectActivity(activityQuick.closest("form"), activity);
+    return;
+  }
+
+  const activitySuggestion = event.target.closest("[data-activity-suggestion]");
+  if (activitySuggestion) {
+    const activity = EXERCISE_DATABASE.find((item) => item.id === activitySuggestion.dataset.activitySuggestion);
+    selectActivity(activitySuggestion.closest("form"), activity);
     return;
   }
 
@@ -1504,7 +1960,8 @@ document.addEventListener("click", (event) => {
   if (!actionButton) return;
   const action = actionButton.dataset.action;
   if (["record-food", "record-training", "record-cardio", "record-weight"].includes(action)) {
-    openSheet(action.replace("record-", ""));
+    const sheetType = action === "record-cardio" ? "training" : action.replace("record-", "");
+    openSheet(sheetType);
   } else if (action === "toggle-fatigue") {
     toggleSetting("fatigueWeek");
   } else if (action === "toggle-bulk") {
@@ -1517,8 +1974,8 @@ document.addEventListener("click", (event) => {
     closeSheet();
   } else if (action === "install") {
     triggerInstall();
-  } else if (action === "widget-help") {
-    openSheet("widget-help");
+  } else if (action === "database-info") {
+    openSheet("database-info");
   } else if (action === "export-data") {
     exportData();
   } else if (action === "import-data") {
@@ -1528,12 +1985,37 @@ document.addEventListener("click", (event) => {
   }
 });
 
+document.addEventListener("input", (event) => {
+  const form = event.target.closest("form[data-form]");
+  if (!form) return;
+  if (event.target.matches("[data-food-input]")) {
+    updateFoodForm(form, event.target.value);
+    showFoodSuggestions(form, event.target.value);
+  } else if (event.target.matches("[data-custom-food-field]")) {
+    refreshCustomFood(form);
+  } else if (event.target.matches("[data-food-amount]")) {
+    if (form.dataset.foodMode === "custom") refreshCustomFood(form);
+    else refreshFoodAmount(form);
+  } else if (event.target.matches("[data-activity-input]")) {
+    updateActivityForm(form, event.target.value);
+    showActivitySuggestions(form, event.target.value);
+  } else if (event.target.matches("[data-activity-duration], [data-activity-intensity]")) {
+    refreshActivityEstimate(form);
+  }
+});
+
+document.addEventListener("change", (event) => {
+  const form = event.target.closest("form[data-form]");
+  if (!form) return;
+  if (event.target.matches("[data-activity-intensity]")) refreshActivityEstimate(form);
+});
+
 document.addEventListener("submit", (event) => {
   const form = event.target.closest("form[data-form]");
   if (!form) return;
   event.preventDefault();
   const type = form.dataset.form;
-  if (["food", "training", "cardio", "weight"].includes(type)) submitRecord(type, form);
+  if (["food", "training", "weight"].includes(type)) submitRecord(type, form);
   else if (type === "profile") updateProfile(form);
   else if (type === "goals") updateGoals(form);
 });
@@ -1544,10 +2026,42 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !$("#bottomSheet").hidden) closeSheet();
 });
 
+document.addEventListener("focusin", (event) => {
+  if (event.target.matches("input, select, textarea")) {
+    document.body.classList.add("keyboard-open");
+  }
+  if (event.target.matches("[data-food-input]")) {
+    const form = event.target.closest("form");
+    if (form && !form.dataset.foodId) showFoodSuggestions(form, event.target.value);
+  } else if (event.target.matches("[data-activity-input]")) {
+    const form = event.target.closest("form");
+    if (form && !form.dataset.activityId) showActivitySuggestions(form, event.target.value);
+  }
+  if (event.target.matches("input, select, textarea") && event.target.closest("#bottomSheet")) {
+    window.setTimeout(() => event.target.scrollIntoView({ block: "center", behavior: "smooth" }), 120);
+  }
+});
+
+document.addEventListener("focusout", (event) => {
+  if (!event.target.matches("input, select, textarea")) return;
+  window.setTimeout(() => {
+    if (!document.activeElement?.matches("input, select, textarea")) {
+      document.body.classList.remove("keyboard-open");
+    }
+  }, 120);
+});
+
 window.addEventListener("beforeinstallprompt", (event) => {
   event.preventDefault();
   deferredInstallPrompt = event;
 });
+
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", syncVisualViewport);
+  window.visualViewport.addEventListener("scroll", syncVisualViewport);
+}
+window.addEventListener("resize", syncVisualViewport);
+syncVisualViewport();
 
 if ("serviceWorker" in navigator && location.protocol !== "file:") {
   window.addEventListener("load", () => {
