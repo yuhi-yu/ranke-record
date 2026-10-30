@@ -1,7 +1,7 @@
 {
-  "name": "燃刻 · 健身与饮食记录",
+  "name": "燃刻 · 训练与周期记录",
   "short_name": "燃刻",
-  "description": "完全离线运行的健身、饮食、有氧与恢复记录工具",
+  "description": "完全离线运行的训练、胃口与增肌减脂周期记录工具",
   "lang": "zh-CN",
   "start_url": "./?source=pwa",
   "scope": "./",

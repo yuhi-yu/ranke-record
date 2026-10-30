@@ -1,9 +1,8 @@
-const CACHE_NAME = "ranke-shell-v3";
+const CACHE_NAME = "ranke-shell-v4";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./styles.css",
-  "./food-database.js",
   "./exercise-database.js",
   "./app.js",
   "./manifest.webmanifest",
